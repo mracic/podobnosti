@@ -1,3 +1,22 @@
+"""
+Slot Data Parser
+
+This script processes slot game data files (.slot) and converts them into structured CSV files.
+It handles various data types including:
+- Basic slot information (name, URL, provider)
+- Game attributes (RTP, variance, bet limits)
+- Features and themes
+- Related slots and provider statistics
+- Review dates and metadata
+
+The script generates two CSV files:
+1. slot_data.csv: Contains detailed information about each slot
+2. provider_stats.csv: Contains aggregated statistics for each provider
+
+The parser handles missing values by converting them to None and maintains both
+list and string representations of array-like fields for compatibility.
+"""
+
 import os
 import re
 import pandas as pd
@@ -5,14 +24,17 @@ from typing import Dict, Any
 from collections import defaultdict
 
 def parse_review_dates(review_text: str) -> Dict[str, str]:
-    """Extract creation and update dates from review text."""
+    """Extract creation and update dates from review text and clean the text."""
     dates_match = re.search(r'dates=ReviewDates\[creation=(\d{4}-\d{2}-\d{2}), update=(\d{4}-\d{2}-\d{2})\]', review_text)
     if dates_match:
+        # Remove the dates part from the review text
+        clean_text = re.sub(r'dates=ReviewDates\[creation=\d{4}-\d{2}-\d{2}, update=\d{4}-\d{2}-\d{2}\],\s*', '', review_text)
         return {
-            'creation_date': dates_match.group(1),
-            'update_date': dates_match.group(2)
+            'review_creation_date': dates_match.group(1),
+            'review_update_date': dates_match.group(2),
+            'review_text': clean_text
         }
-    return {'creation_date': None, 'update_date': None}
+    return {'review_creation_date': None, 'review_update_date': None, 'review_text': review_text}
 
 def parse_self_line(line: str) -> Dict[str, str]:
     """Parse the @SELF line into components."""
@@ -41,7 +63,11 @@ def parse_attribute_line(line: str) -> Dict[str, Any]:
                 match = re.search(r'\((.*?),\s*(.*?)\)', line)
                 if match:
                     type_name, value = match.groups()
-                    return {type_name.strip(): value.strip()}
+                    value = value.strip()
+                    # Convert Unknown to None
+                    if value == "Unknown":
+                        value = None
+                    return {type_name.strip(): value}
             return {}
             
         name, value = parts
@@ -59,17 +85,39 @@ def parse_attribute_line(line: str) -> Dict[str, Any]:
             if type_name in ['LAST_UPDATE', 'RELEASE_DATE']:
                 # Keep dates as strings
                 return {type_name.strip(): actual_value}
-            elif type_name in ['LAYOUT', 'TYPE', 'PROVIDER', 'THEME', 'FEATURES', 'OTHER_TAGS', 'TECHNOLOGY', 'OBJECTS', 'GENRE']:
-                # Keep these as strings or lists
-                if actual_value.startswith('[') and actual_value.endswith(']'):
-                    actual_value = eval(actual_value)
+            elif type_name == 'TYPE':
+                # Handle TYPE as a single value
+                if actual_value == "Unknown":
+                    actual_value = None
                 return {type_name.strip(): actual_value}
+            elif type_name in ['LAYOUT', 'PROVIDER', 'THEME', 'FEATURES', 'OTHER_TAGS', 'TECHNOLOGY', 'OBJECTS', 'GENRE']:
+                # Handle lists
+                try:
+                    if actual_value.startswith('[') and actual_value.endswith(']'):
+                        parsed_list = eval(actual_value)
+                    else:
+                        parsed_list = []
+                    return {
+                        type_name.strip(): parsed_list,
+                        f"{type_name.strip()}_str": str(parsed_list)
+                    }
+                except:
+                    return {
+                        type_name.strip(): [],
+                        f"{type_name.strip()}_str": '[]'
+                    }
             else:
                 # Try to convert to float for numeric values
                 try:
                     if actual_value.replace('.', '').replace('-', '').isdigit():
                         actual_value = float(actual_value)
+                        # Convert -99.0 to None for numeric values
+                        if actual_value == -99.0:
+                            actual_value = None
                 except ValueError:
+                    # Convert "Unknown" to None for string values
+                    if actual_value == "Unknown":
+                        actual_value = None
                     pass  # Keep as string if conversion fails
             
             return {type_name.strip(): actual_value}
@@ -120,7 +168,6 @@ def parse_slot_file(file_path: str) -> Dict[str, Any]:
                     if i + 1 < len(lines):
                         review_text = lines[i + 1].strip()
                         data['review'] = {
-                            'text': review_text,
                             **parse_review_dates(review_text)
                         }
                         i += 2
@@ -164,9 +211,9 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     provider_stats = defaultdict(lambda: {
         'game_count': 0,
         'total_rtp': 0,
-        'avg_rtp': 0,
+        'rtp_count': 0,
         'total_max_win': 0,
-        'avg_max_win': 0,
+        'max_win_count': 0,
         'game_types': set(),
         'features': set(),
         'themes': set(),
@@ -226,28 +273,34 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             # Add review data
             if slot_data['review']:
                 flat_data.update({
-                    'review_text': slot_data['review'].get('text'),
-                    'creation_date': slot_data['review'].get('creation_date'),
-                    'update_date': slot_data['review'].get('update_date')
+                    'review_text': slot_data['review'].get('review_text'),
+                    'review_creation_date': slot_data['review'].get('creation_date'),
+                    'review_update_date': slot_data['review'].get('update_date')
                 })
             
             # Add attributes with default values
             flat_data.update({
-                'RTP': slot_data['attributes'].get('RTP', -99.0),
-                'MAX_WIN_RELATIVE': slot_data['attributes'].get('MAX_WIN_RELATIVE', -99.0),
-                'MIN_BET': slot_data['attributes'].get('MIN_BET', -99.0),
-                'MAX_BET': slot_data['attributes'].get('MAX_BET', -99.0),
-                'VARIANCE': slot_data['attributes'].get('VARIANCE', -99),
-                'HIT_FREQUENCY': slot_data['attributes'].get('HIT_FREQUENCY', -99.0),
-                'GAME_SIZE': slot_data['attributes'].get('GAME_SIZE', -99.0),
-                'TYPE': slot_data['attributes'].get('TYPE', 'Unknown'),
-                'LAYOUT': slot_data['attributes'].get('LAYOUT', 'Unknown'),
+                'RTP': slot_data['attributes'].get('RTP', None),
+                'MAX_WIN_RELATIVE': slot_data['attributes'].get('MAX_WIN_RELATIVE', None),
+                'MIN_BET': slot_data['attributes'].get('MIN_BET', None),
+                'MAX_BET': slot_data['attributes'].get('MAX_BET', None),
+                'VARIANCE': slot_data['attributes'].get('VARIANCE', None),
+                'HIT_FREQUENCY': slot_data['attributes'].get('HIT_FREQUENCY', None),
+                'GAME_SIZE': slot_data['attributes'].get('GAME_SIZE', None),
+                'TYPE': slot_data['attributes'].get('TYPE', None),
+                'LAYOUT': slot_data['attributes'].get('LAYOUT', None),
                 'FEATURES': slot_data['attributes'].get('FEATURES', []),
+                'FEATURES_str': slot_data['attributes'].get('FEATURES_str', '[]'),
                 'THEME': slot_data['attributes'].get('THEME', []),
+                'THEME_str': slot_data['attributes'].get('THEME_str', '[]'),
                 'TECHNOLOGY': slot_data['attributes'].get('TECHNOLOGY', []),
+                'TECHNOLOGY_str': slot_data['attributes'].get('TECHNOLOGY_str', '[]'),
                 'OTHER_TAGS': slot_data['attributes'].get('OTHER_TAGS', []),
+                'OTHER_TAGS_str': slot_data['attributes'].get('OTHER_TAGS_str', '[]'),
                 'OBJECTS': slot_data['attributes'].get('OBJECTS', []),
+                'OBJECTS_str': slot_data['attributes'].get('OBJECTS_str', '[]'),
                 'GENRE': slot_data['attributes'].get('GENRE', []),
+                'GENRE_str': slot_data['attributes'].get('GENRE_str', '[]'),
                 'LAST_UPDATE': slot_data['attributes'].get('LAST_UPDATE', None),
                 'RELEASE_DATE': slot_data['attributes'].get('RELEASE_DATE', None)
             })
@@ -268,7 +321,9 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             # Add related slots and top provider slots as ID lists
             flat_data.update({
                 'related_slot_ids': related_slot_ids,
+                'related_slot_ids_str': str(related_slot_ids),
                 'top_provider_slot_ids': top_provider_slot_ids,
+                'top_provider_slot_ids_str': str(top_provider_slot_ids),
                 'related_slots_count': len(related_slot_ids),
                 'top_provider_slots_count': len(top_provider_slot_ids)
             })
@@ -283,11 +338,19 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                     current_provider_id += 1
                 provider_stats[provider]['provider_id'] = provider_id_map[provider]
                 provider_stats[provider]['game_count'] += 1
-                if flat_data['RTP'] != -99.0:
+                
+                # Update RTP statistics
+                if flat_data['RTP'] is not None:
                     provider_stats[provider]['total_rtp'] += flat_data['RTP']
-                if flat_data['MAX_WIN_RELATIVE'] != -99.0:
+                    provider_stats[provider]['rtp_count'] += 1
+                
+                # Update max win statistics
+                if flat_data['MAX_WIN_RELATIVE'] is not None:
                     provider_stats[provider]['total_max_win'] += flat_data['MAX_WIN_RELATIVE']
-                if flat_data['TYPE'] != 'Unknown':
+                    provider_stats[provider]['max_win_count'] += 1
+                
+                # Update categorical statistics
+                if flat_data['TYPE'] is not None:
                     provider_stats[provider]['game_types'].add(flat_data['TYPE'])
                 if isinstance(flat_data['FEATURES'], list):
                     provider_stats[provider]['features'].update(flat_data['FEATURES'])
@@ -299,9 +362,10 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     # Calculate averages and convert sets to lists for provider stats
     for provider in provider_stats:
         stats = provider_stats[provider]
-        if stats['game_count'] > 0:
-            stats['avg_rtp'] = stats['total_rtp'] / stats['game_count']
-            stats['avg_max_win'] = stats['total_max_win'] / stats['game_count']
+        if stats['rtp_count'] > 0:
+            stats['avg_rtp'] = stats['total_rtp'] / stats['rtp_count']
+        if stats['max_win_count'] > 0:
+            stats['avg_max_win'] = stats['total_max_win'] / stats['max_win_count']
         stats['game_types'] = list(stats['game_types'])
         stats['features'] = list(stats['features'])
         stats['themes'] = list(stats['themes'])
@@ -326,27 +390,31 @@ def print_statistics(df: pd.DataFrame, provider_df: pd.DataFrame):
         for provider, row in provider_df.nlargest(10, 'game_count').iterrows():
             print(f"- {provider}: {row['game_count']} games")
             print(f"  Provider ID: {row['provider_id']}")
-            print(f"  Average RTP: {row['avg_rtp']:.2f}%")
-            print(f"  Average Max Win: {row['avg_max_win']:.2f}x")
+            if row['rtp_count'] > 0:
+                print(f"  Average RTP: {row['avg_rtp']:.2f}% (based on {row['rtp_count']} games)")
+            if row['max_win_count'] > 0:
+                print(f"  Average Max Win: {row['avg_max_win']:.2f}x (based on {row['max_win_count']} games)")
             print(f"  Game Types: {', '.join(row['game_types'])}")
     
     # RTP statistics
     if 'RTP' in df.columns:
-        rtp_stats = df[df['RTP'] != -99.0]['RTP'].describe()
-        print(f"\nRTP Statistics (excluding -99.0):")
+        rtp_stats = df['RTP'].dropna().describe()
+        print(f"\nRTP Statistics (excluding None values):")
         print(f"- Mean: {rtp_stats['mean']:.2f}%")
         print(f"- Median: {rtp_stats['50%']:.2f}%")
         print(f"- Min: {rtp_stats['min']:.2f}%")
         print(f"- Max: {rtp_stats['max']:.2f}%")
+        print(f"- Missing values: {df['RTP'].isna().sum()}")
     
     # Max win statistics
     if 'MAX_WIN_RELATIVE' in df.columns:
-        win_stats = df[df['MAX_WIN_RELATIVE'] != -99.0]['MAX_WIN_RELATIVE'].describe()
-        print(f"\nMax Win Statistics (x bet, excluding -99.0):")
+        win_stats = df['MAX_WIN_RELATIVE'].dropna().describe()
+        print(f"\nMax Win Statistics (x bet, excluding None values):")
         print(f"- Mean: {win_stats['mean']:.2f}x")
         print(f"- Median: {win_stats['50%']:.2f}x")
         print(f"- Min: {win_stats['min']:.2f}x")
         print(f"- Max: {win_stats['max']:.2f}x")
+        print(f"- Missing values: {df['MAX_WIN_RELATIVE'].isna().sum()}")
     
     # Feature statistics
     if 'FEATURES' in df.columns:
@@ -360,7 +428,7 @@ def print_statistics(df: pd.DataFrame, provider_df: pd.DataFrame):
             print(f"- {feature}: {count} games")
     
     # Related slots statistics
-    if 'related_slots' in df.columns:
+    if 'related_slots_count' in df.columns:
         related_counts = df['related_slots_count'].describe()
         print("\nRelated Slots Statistics:")
         print(f"- Mean: {related_counts['mean']:.2f}")
@@ -369,7 +437,7 @@ def print_statistics(df: pd.DataFrame, provider_df: pd.DataFrame):
         print(f"- Max: {related_counts['max']:.2f}")
     
     # Top provider slots statistics
-    if 'top_provider_slots' in df.columns:
+    if 'top_provider_slots_count' in df.columns:
         top_counts = df['top_provider_slots_count'].describe()
         print("\nTop Provider Slots Statistics:")
         print(f"- Mean: {top_counts['mean']:.2f}")
@@ -381,14 +449,14 @@ if __name__ == "__main__":
     try:
         # Process all slot files
         df, provider_df = process_all_slots('raw_game_data')
-        
+        directory = 'pared_data'
         # Save to CSV
-        df.to_csv('slot_data.csv', index=False)
-        provider_df.to_csv('provider_stats.csv')
+        df.to_csv(os.path.join(directory, 'slot_data.csv'), index=False)
+        provider_df.to_csv(os.path.join(directory, 'provider_stats.csv'))
         print(f"Successfully processed {len(df)} slot files and saved to slot_data.csv and provider_stats.csv")
         
         # Print statistics
-        print_statistics(df, provider_df)
+        #print_statistics(df, provider_df)
         
     except Exception as e:
         print(f"Error: {str(e)}")
