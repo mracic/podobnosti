@@ -1,3 +1,7 @@
+# Data
+raw_game_data
+parsed_data
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
