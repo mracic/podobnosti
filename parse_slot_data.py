@@ -98,13 +98,11 @@ def parse_attribute_line(line: str) -> Dict[str, Any]:
                     else:
                         parsed_list = []
                     return {
-                        type_name.strip(): parsed_list,
-                        f"{type_name.strip()}_str": str(parsed_list)
+                        type_name.strip(): parsed_list
                     }
                 except:
                     return {
-                        type_name.strip(): [],
-                        f"{type_name.strip()}_str": '[]'
+                        type_name.strip(): []
                     }
             else:
                 # Try to convert to float for numeric values
@@ -290,17 +288,11 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
                 'TYPE': slot_data['attributes'].get('TYPE', None),
                 'LAYOUT': slot_data['attributes'].get('LAYOUT', None),
                 'FEATURES': slot_data['attributes'].get('FEATURES', []),
-                'FEATURES_str': slot_data['attributes'].get('FEATURES_str', '[]'),
                 'THEME': slot_data['attributes'].get('THEME', []),
-                'THEME_str': slot_data['attributes'].get('THEME_str', '[]'),
                 'TECHNOLOGY': slot_data['attributes'].get('TECHNOLOGY', []),
-                'TECHNOLOGY_str': slot_data['attributes'].get('TECHNOLOGY_str', '[]'),
                 'OTHER_TAGS': slot_data['attributes'].get('OTHER_TAGS', []),
-                'OTHER_TAGS_str': slot_data['attributes'].get('OTHER_TAGS_str', '[]'),
                 'OBJECTS': slot_data['attributes'].get('OBJECTS', []),
-                'OBJECTS_str': slot_data['attributes'].get('OBJECTS_str', '[]'),
                 'GENRE': slot_data['attributes'].get('GENRE', []),
-                'GENRE_str': slot_data['attributes'].get('GENRE_str', '[]'),
                 'LAST_UPDATE': slot_data['attributes'].get('LAST_UPDATE', None),
                 'RELEASE_DATE': slot_data['attributes'].get('RELEASE_DATE', None)
             })
@@ -321,9 +313,7 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             # Add related slots and top provider slots as ID lists
             flat_data.update({
                 'related_slot_ids': related_slot_ids,
-                'related_slot_ids_str': str(related_slot_ids),
                 'top_provider_slot_ids': top_provider_slot_ids,
-                'top_provider_slot_ids_str': str(top_provider_slot_ids),
                 'related_slots_count': len(related_slot_ids),
                 'top_provider_slots_count': len(top_provider_slot_ids)
             })
@@ -449,7 +439,7 @@ if __name__ == "__main__":
     try:
         # Process all slot files
         df, provider_df = process_all_slots('raw_game_data')
-        directory = 'pared_data'
+        directory = 'parsed_data'
         # Save to CSV
         df.to_csv(os.path.join(directory, 'slot_data.csv'), index=False)
         provider_df.to_csv(os.path.join(directory, 'provider_stats.csv'))
