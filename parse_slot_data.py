@@ -272,8 +272,8 @@ def process_all_slots(directory: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             if slot_data['review']:
                 flat_data.update({
                     'review_text': slot_data['review'].get('review_text'),
-                    'review_creation_date': slot_data['review'].get('creation_date'),
-                    'review_update_date': slot_data['review'].get('update_date')
+                    'review_creation_date': slot_data['review'].get('review_creation_date'),
+                    'review_update_date': slot_data['review'].get('review_update_date')
                 })
             
             # Add attributes with default values
