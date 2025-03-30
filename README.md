@@ -67,12 +67,12 @@ Response:
 
 ## Ideas for future work
  - using similar games for estimating missing features
- - using categorical features (binary encoding)
+ - using embedings for categorical features
  - year of game creation
  - days since last update
  - tf-idf of review_text
- - data split (k-fold, provider, last year, genre)
+ - data split (k-fold, provider, last year, genre, stratified)
  - feature encoding (RTP 90%, 95%)
- - encoding LAYOUT, FEATURES, TECHNOLOGY
  - graphs to model related_slot, most popular and connected slots (games that connect clusters)
+ - multilabel classification
  

@@ -90,7 +90,18 @@ def parse_attribute_line(line: str) -> Dict[str, Any]:
                 if actual_value == "Unknown":
                     actual_value = None
                 return {type_name.strip(): actual_value}
-            elif type_name in ['LAYOUT', 'PROVIDER', 'THEME', 'FEATURES', 'OTHER_TAGS', 'TECHNOLOGY', 'OBJECTS', 'GENRE']:
+            elif type_name == 'LAYOUT':
+                # Special handling for layout format (e.g., "5-3 [ i ]")
+                try:
+                    # Extract grid dimensions, ignoring anything in square brackets
+                    grid_match = re.match(r'(\d+)-(\d+)', actual_value)
+                    if grid_match:
+                        rows, cols = map(int, grid_match.groups())
+                        return {'LAYOUT': f"{rows}x{cols}"}
+                except:
+                    pass
+                return {'LAYOUT': actual_value}
+            elif type_name in ['PROVIDER', 'THEME', 'FEATURES', 'OTHER_TAGS', 'TECHNOLOGY', 'OBJECTS', 'GENRE']:
                 # Handle lists
                 try:
                     if actual_value.startswith('[') and actual_value.endswith(']'):
