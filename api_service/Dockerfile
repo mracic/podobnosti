@@ -8,7 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code and model files
 COPY api_service/main.py .
-COPY numeric_similarity_model.py .
 COPY api_service/model.pkl .
 
 # Expose port

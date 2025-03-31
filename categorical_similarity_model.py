@@ -3,431 +3,440 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
 import logging
-from collections import Counter
-from typing import List, Tuple, Dict, Optional
-import pickle
 from scipy.sparse import hstack, csr_matrix
-import os
+from typing import Dict, List, Tuple
+from collections import Counter
+import pickle
 
-# Set up minimal logging
+# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-class CategoricalGameSimilarityModel:
-    def __init__(self, n_neighbors: int = 3, random_state: int = 42):
-        """
-        Initialize the model.
+def load_data(filepath: str) -> pd.DataFrame:
+    """Load and prepare the data."""
+    try:
+        df = pd.read_csv(filepath)
+        logger.info(f"Loaded data with shape: {df.shape}")
         
-        Args:
-            n_neighbors: Number of similar games to consider for prediction
-            random_state: Random seed for reproducibility
-        """
-        self.n_neighbors = n_neighbors
-        self.model = None
-        self.feature_names = None
-        self.random_state = random_state
-        self.train_indices = None
-        self.test_indices = None
-        self.game_id_to_idx = None
-        self.all_related_slots = None
+        # Remove games with missing related slots
+        df = df.dropna(subset=['related_slot_ids'])
+        df['related_slot_ids'] = df['related_slot_ids'].apply(lambda x: eval(x) if isinstance(x, str) else x)
+        df = df[df['related_slot_ids'].apply(len) > 0]  # Remove games with empty related slots
+        logger.info(f"After removing games with missing/empty related slots: {df.shape}")
         
-        # Initialize preprocessing components
-        self.scaler = StandardScaler()
+        # Convert string representations of lists to actual lists for categorical columns
+        categorical_columns = ['FEATURES', 'THEME', 'GENRE', 'OTHER_TAGS', 'TECHNOLOGY', 'OBJECTS', 'TYPE']
         
-        # Define categorical columns and their prefixes
-        self.categorical_columns = {
-            'FEATURES': 'feature',
-            'THEME': 'theme',
-            'GENRE': 'genre',
-            'OTHER_TAGS': 'tag',
-            'TECHNOLOGY': 'tech',
-            'OBJECTS': 'object',
-            'TYPE': 'type'
-        }
+        def safe_eval(x):
+            if not isinstance(x, str):
+                return x
+            try:
+                return eval(x)
+            except (SyntaxError, ValueError):
+                return [x]
         
-        # Initialize MLB for each categorical column
-        self.mlb_transformers = {
-            col: MultiLabelBinarizer() 
-            for col in self.categorical_columns.keys()
-        }
+        for col in categorical_columns:
+            if col in df.columns:
+                df[col] = df[col].apply(safe_eval)
+        
+        # Process LAYOUT as numeric features
+        if 'LAYOUT' in df.columns:
+            def parse_layout(x):
+                if not isinstance(x, str):
+                    return pd.Series([0, 0])
+                try:
+                    rows, cols = map(int, x.split('x'))
+                    return pd.Series([rows, cols])
+                except (ValueError, AttributeError):
+                    return pd.Series([0, 0])
+            
+            df[['layout_rows', 'layout_cols']] = df['LAYOUT'].apply(parse_layout)
+            df = df.drop('LAYOUT', axis=1)
+        
+        # Keep numeric columns
+        numeric_columns = df.select_dtypes(include=[np.number]).columns
+        excluded_columns = ['top_provider_slots_count', 'related_slots_count']
+        numeric_columns = [col for col in numeric_columns if col not in excluded_columns and col != 'slot_id']
+        
+        # Handle slot_id column
+        if 'slot_id' in df.columns:
+            # Keep only the first slot_id column if there are duplicates
+            slot_id_cols = df.columns[df.columns == 'slot_id'].tolist()
+            if len(slot_id_cols) > 1:
+                logger.info(f"Found {len(slot_id_cols)} slot_id columns, keeping only the first one")
+                # Keep only the first slot_id column
+                df = df.rename(columns={slot_id_cols[0]: 'slot_id_temp'})
+                for col in slot_id_cols:
+                    df = df.drop(col, axis=1)
+                df = df.rename(columns={'slot_id_temp': 'slot_id'})
+            
+            # Convert to integer type
+            df['slot_id'] = df['slot_id'].astype(int)
+            logger.info(f"slot_id column type after conversion: {df['slot_id'].dtype}")
+            logger.info(f"First few slot_ids: {df['slot_id'].head()}")
+        
+        # Combine numeric and categorical columns
+        selected_columns = numeric_columns + categorical_columns + ['related_slot_ids', 'slot_id']
+        df = df[selected_columns].copy()  # Make a copy to ensure we have a clean DataFrame
+        
+        # Verify we only have one slot_id column
+        slot_id_cols = df.columns[df.columns == 'slot_id'].tolist()
+        if len(slot_id_cols) != 1:
+            raise ValueError(f"Expected 1 slot_id column but found {len(slot_id_cols)}")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error loading data: {str(e)}")
+        raise
 
-    def save(self, filepath: str) -> None:
-        """
-        Save the model state to a file.
+def prepare_features(df: pd.DataFrame, train_indices: np.ndarray = None) -> np.ndarray:
+    """Prepare feature matrix with optional train/test split."""
+    # Handle numeric features
+    numeric_columns = [col for col in df.select_dtypes(include=[np.number]).columns 
+                      if col != 'related_slot_ids']
+    
+    # Scale numeric features
+    scaler = StandardScaler()
+    X_numeric = df[numeric_columns].fillna(df[numeric_columns].median())
+    
+    if train_indices is not None:
+        # Fit scaler on training data only
+        X_numeric_scaled = np.zeros_like(X_numeric)
+        X_numeric_scaled[train_indices] = scaler.fit_transform(X_numeric.iloc[train_indices])
+        X_numeric_scaled[~train_indices] = scaler.transform(X_numeric.iloc[~train_indices])
+    else:
+        X_numeric_scaled = scaler.fit_transform(X_numeric)
+    
+    # Process categorical features
+    feature_names = list(numeric_columns)
+    sparse_matrices = [csr_matrix(X_numeric_scaled)]
+    
+    # Define categorical columns and their prefixes
+    categorical_columns = {
+        'FEATURES': 'feature',
+        'THEME': 'theme',
+        'GENRE': 'genre',
+        'OTHER_TAGS': 'tag',
+        'TECHNOLOGY': 'tech',
+        'OBJECTS': 'object',
+        'TYPE': 'type'
+    }
+    
+    # Process each categorical column
+    for col, prefix in categorical_columns.items():
+        if col in df.columns:
+            # Transform the column's values with prefix
+            transformed = df[col].apply(lambda x: [f"{prefix}_{item}" for item in x])
+            
+            # Get MLB for this column
+            mlb = MultiLabelBinarizer()
+            if train_indices is not None:
+                # Fit MLB on training data only
+                train_transformed = mlb.fit_transform(transformed.iloc[train_indices])
+                test_transformed = mlb.transform(transformed.iloc[~train_indices])
+                
+                # Create sparse matrix for all data
+                X_cat = csr_matrix((len(df), train_transformed.shape[1]))
+                X_cat[train_indices] = train_transformed
+                X_cat[~train_indices] = test_transformed
+            else:
+                X_cat = mlb.fit_transform(transformed)
+            
+            # Add feature names
+            feature_names.extend([f"{prefix}_{item}" for item in mlb.classes_])
+            sparse_matrices.append(X_cat)
+    
+    # Combine all features
+    X = hstack(sparse_matrices).tocsr()
+    
+    logger.info(f"Total number of features: {len(feature_names)}")
+    logger.info(f"Feature matrix shape: {X.shape}")
+    
+    return X
+
+def get_top_related_slots(df: pd.DataFrame, indices: np.ndarray, distances: np.ndarray, train_indices: np.ndarray, full_related_slots: np.ndarray, is_train: bool = True, n_slots: int = 8) -> List[Tuple[int, List[int], float]]:
+    """
+    Get top related slots from multiple neighbors.
+    
+    Args:
+        df: DataFrame containing the samples to predict for
+        indices: Neighbor indices from KNN model
+        distances: Distances to neighbors
+        train_indices: Boolean array indicating training samples
+        full_related_slots: Array of related slots for all samples
+        is_train: Whether predicting for training samples (True) or test samples (False)
+        n_slots: Number of slots to predict
+    """
+    results = []
+    total_games = len(df)
+    
+    # Get the mapping from training indices to full dataset indices
+    train_to_full = np.where(train_indices)[0]
+    
+    # Process in batches of 1000
+    batch_size = 1000
+    for i in range(0, total_games, batch_size):
+        batch_end = min(i + batch_size, total_games)
         
-        Args:
-            filepath: Path to save the model
-        """
+        for j in range(i, batch_end):
+            # Get related slots from all neighbors
+            neighbor_slots = []
+            # indices[j] is already an array of neighbor indices
+            for neighbor_idx in indices[j]:
+                # Map the neighbor index from training set to full dataset
+                full_idx = train_to_full[neighbor_idx]
+                neighbor_slots.extend(full_related_slots[full_idx])
+            
+            # Count frequencies of slots
+            slot_counts = Counter(neighbor_slots)
+            
+            # Get top n_slots most common slots
+            top_slots = [slot for slot, _ in slot_counts.most_common(n_slots)]
+            
+            # Calculate average distance to neighbors
+            avg_distance = np.mean(distances[j])
+            
+            # For test samples, j is relative to test set, so we need the actual index
+            if not is_train:
+                game_idx = np.where(~train_indices)[0][j]
+            else:
+                game_idx = train_to_full[j]  # Map training index to full dataset index
+            
+            results.append((game_idx, top_slots, avg_distance))
+    
+    return results
+
+def evaluate_related_slots_predictions(test_df: pd.DataFrame, indices: np.ndarray, distances: np.ndarray, train_indices: np.ndarray, full_related_slots: np.ndarray, n_slots: int = 8) -> Dict[str, float]:
+    """Evaluate predictions based on related slot IDs."""
+    correct_predictions = 0
+    total_games = len(test_df)
+    
+    # Get top predicted slots for each game
+    predictions = get_top_related_slots(test_df, indices, distances, train_indices, full_related_slots, is_train=False, n_slots=n_slots)
+    
+    # Evaluate each prediction
+    for i, (game_idx, predicted_slots, avg_distance) in enumerate(predictions):
+        actual_slots = set(test_df['related_slot_ids'].iloc[i])
+        predicted_slots = set(predicted_slots)
+        
+        # Calculate overlap between actual and predicted slots
+        overlap = len(actual_slots.intersection(predicted_slots))
+        total_unique = len(actual_slots.union(predicted_slots))
+        
+        # Consider it correct if there's significant overlap
+        if overlap > 0 and overlap / total_unique >= 0.5:  # At least 50% overlap
+            correct_predictions += 1
+    
+    accuracy = correct_predictions / total_games
+    precision = correct_predictions / total_games
+    recall = correct_predictions / total_games
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'correct_predictions': correct_predictions,
+        'total_games': total_games
+    }
+
+def save_model(filepath: str, model, X: np.ndarray, train_indices: np.ndarray, df: pd.DataFrame) -> None:
+    """
+    Save the model and all necessary data for predictions.
+    
+    Args:
+        filepath: Path to save the model
+        model: Trained KNN model
+        X: Feature matrix
+        train_indices: Boolean array indicating training samples
+        df: Original dataframe with related slots
+    """
+    try:
+        # Save indices mappings for both train and test sets
+        train_idx_map = np.where(train_indices)[0]
+        test_idx_map = np.where(~train_indices)[0]
+        
+        # Get the slot_ids from the DataFrame and ensure they are single values
+        slot_ids = df['slot_id'].values
+        
+        # Create mappings using the slot_ids
+        slot_id_to_idx = {int(slot_id): idx for idx, slot_id in enumerate(slot_ids)}
+        idx_to_slot_id = {idx: int(slot_id) for slot_id, idx in slot_id_to_idx.items()}
+        
         state = {
-            'model': self.model,
-            'feature_names': self.feature_names,
-            'all_related_slots': self.all_related_slots,
-            'n_neighbors': self.n_neighbors,
-            'random_state': self.random_state,
-            'game_id_to_idx': self.game_id_to_idx,
-            'train_indices': self.train_indices,
-            'test_indices': self.test_indices,
-            'mlb_transformers': self.mlb_transformers,
-            'scaler': self.scaler
+            'model': model,
+            'feature_matrix': X,
+            'train_indices': train_indices,
+            'related_slots': df['related_slot_ids'].values,
+            'train_idx_map': train_idx_map,
+            'test_idx_map': test_idx_map,
+            'slot_id_to_idx': slot_id_to_idx,
+            'idx_to_slot_id': idx_to_slot_id,
+            'n_neighbors': model.n_neighbors,
+            'metric': model.metric,
+            'algorithm': model.algorithm
         }
+        
         with open(filepath, 'wb') as f:
             pickle.dump(state, f)
-        logger.info(f"Model saved to {filepath}")
+        logger.info(f"Model and data saved to {filepath}")
+        logger.info(f"Number of slot IDs: {len(slot_id_to_idx)}")
+        logger.info(f"Example slot_id mapping: {list(slot_id_to_idx.items())[:5]}")
         
-    @classmethod
-    def load(cls, filepath: str) -> 'CategoricalGameSimilarityModel':
-        """
-        Load a saved model state from a file.
+    except Exception as e:
+        logger.error(f"Error saving model: {str(e)}")
+        raise
+
+def load_saved_model(filepath: str) -> Tuple[NearestNeighbors, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[int, int], Dict[int, int]]:
+    """
+    Load a saved model and its associated data.
+    
+    Args:
+        filepath: Path to the saved model
         
-        Args:
-            filepath: Path to the saved model
-            
-        Returns:
-            Loaded model instance
-        """
+    Returns:
+        Tuple containing:
+        - Trained KNN model
+        - Feature matrix
+        - Training indices
+        - Related slots array
+        - Training indices mapping
+        - Test indices mapping
+        - Slot ID to index mapping
+        - Index to slot ID mapping
+    """
+    try:
         with open(filepath, 'rb') as f:
             state = pickle.load(f)
+            
+        model = state['model']
+        X = state['feature_matrix']
+        train_indices = state['train_indices']
+        related_slots = state['related_slots']
+        train_idx_map = state['train_idx_map']
+        test_idx_map = state['test_idx_map']
+        slot_id_to_idx = state['slot_id_to_idx']
+        idx_to_slot_id = state['idx_to_slot_id']
         
-        model = cls(
-            n_neighbors=state['n_neighbors'],
-            random_state=state['random_state']
-        )
-        model.model = state['model']
-        model.feature_names = state['feature_names']
-        model.all_related_slots = state['all_related_slots']
-        model.game_id_to_idx = state['game_id_to_idx']
-        model.train_indices = state['train_indices']
-        model.test_indices = state['test_indices']
-        model.mlb_transformers = state['mlb_transformers']
-        model.scaler = state['scaler']
         logger.info(f"Model loaded from {filepath}")
-        return model
+        logger.info(f"Model parameters: n_neighbors={model.n_neighbors}, metric={model.metric}")
+        logger.info(f"Feature matrix shape: {X.shape}")
+        logger.info(f"Number of training samples: {len(train_idx_map)}")
+        logger.info(f"Number of test samples: {len(test_idx_map)}")
+        logger.info(f"Number of slot IDs: {len(slot_id_to_idx)}")
+        
+        return model, X, train_indices, related_slots, train_idx_map, test_idx_map, slot_id_to_idx, idx_to_slot_id
+        
+    except Exception as e:
+        logger.error(f"Error loading model: {str(e)}")
+        raise
 
-    def load_data(self, filepath: str) -> pd.DataFrame:
-        """
-        Load and prepare the data.
-        
-        Args:
-            filepath: Path to the CSV file
-            
-        Returns:
-            DataFrame with selected features
-        """
-        try:
-            df = pd.read_csv(filepath)
-            logger.info(f"Loaded data with shape: {df.shape}")
-            
-            # Remove games with missing related slots
-            df = df.dropna(subset=['related_slot_ids'])
-            df['related_slot_ids'] = df['related_slot_ids'].apply(lambda x: eval(x) if isinstance(x, str) else x)
-            df = df[df['related_slot_ids'].apply(len) > 0]  # Remove games with empty related slots
-            logger.info(f"After removing games with missing/empty related slots: {df.shape}")
-            
-            # Store game ID to index mapping
-            self.game_id_to_idx = {game_id: idx for idx, game_id in enumerate(df['slot_id'])}
-            
-            # Store all related slots for analysis
-            self.all_related_slots = df['related_slot_ids'].values
-            
-            # Convert string representations of lists to actual lists for categorical columns
-            categorical_columns = ['FEATURES', 'THEME', 'GENRE', 'OTHER_TAGS', 'TECHNOLOGY', 'OBJECTS', 'TYPE']
-            
-            def safe_eval(x):
-                if not isinstance(x, str):
-                    return x
-                try:
-                    # Try to evaluate as a Python literal
-                    return eval(x)
-                except (SyntaxError, ValueError):
-                    # If evaluation fails, treat as a single value
-                    return [x]
-            
-            for col in categorical_columns:
-                if col in df.columns:
-                    df[col] = df[col].apply(safe_eval)
-            
-            # Process LAYOUT as numeric features
-            if 'LAYOUT' in df.columns:
-                def parse_layout(x):
-                    if not isinstance(x, str):
-                        return pd.Series([0, 0])  # Default values if not a string
-                    try:
-                        # Split the layout string (e.g., "5x3") and convert to integers
-                        rows, cols = map(int, x.split('x'))
-                        return pd.Series([rows, cols])
-                    except (ValueError, AttributeError):
-                        return pd.Series([0, 0])  # Default values if parsing fails
-                
-                # Split LAYOUT into rows and columns
-                df[['layout_rows', 'layout_cols']] = df['LAYOUT'].apply(parse_layout)
-                df = df.drop('LAYOUT', axis=1)  # Remove the original LAYOUT column
-            
-            # Keep numeric columns
-            numeric_columns = df.select_dtypes(include=[np.number]).columns
-            excluded_columns = ['slot_id', 'top_provider_slots_count', 'related_slots_count']
-            numeric_columns = [col for col in numeric_columns if col not in excluded_columns]
-            
-            # Combine numeric and categorical columns
-            selected_columns = numeric_columns + categorical_columns + ['related_slot_ids']
-            df = df[selected_columns]
-            
-            # Log missing values
-            missing_counts = df[numeric_columns].isna().sum()
-            total_rows = len(df)
-            logger.info("\nMissing values in numeric columns:")
-            for col, count in missing_counts[missing_counts > 0].items():
-                percentage = (count / total_rows) * 100
-                logger.info(f"{col}: {count} ({percentage:.1f}%)")
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error loading data: {str(e)}")
-            raise
-
-    def prepare_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Prepare feature matrix and split into train/test sets.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            Tuple containing:
-            - Training feature matrix
-            - Test feature matrix
-        """
-        # First split the data
-        np.random.seed(self.random_state)
-        n_samples = len(df)
-        indices = np.random.permutation(n_samples)
-        train_size = int(0.8 * n_samples)
-        self.train_indices = indices[:train_size]
-        self.test_indices = indices[train_size:]
-        
-        # Split DataFrame
-        df_train = df.iloc[self.train_indices].copy()
-        df_test = df.iloc[self.test_indices].copy()
-        
-        # Handle numeric features
-        numeric_columns = [col for col in df.select_dtypes(include=[np.number]).columns 
-                         if col != 'related_slot_ids']
-        
-        # Fit scaler on training data only
-        X_train_numeric = df_train[numeric_columns].fillna(df_train[numeric_columns].median())
-        X_test_numeric = df_test[numeric_columns].fillna(df_test[numeric_columns].median())
-        X_train_numeric_scaled = self.scaler.fit_transform(X_train_numeric)
-        X_test_numeric_scaled = self.scaler.transform(X_test_numeric)  # Use transform, not fit_transform
-        
-        # Process categorical features
-        feature_names = list(numeric_columns)
-        train_sparse_matrices = [csr_matrix(X_train_numeric_scaled)]
-        test_sparse_matrices = [csr_matrix(X_test_numeric_scaled)]
-        
-        # Process each categorical column separately
-        for col, prefix in self.categorical_columns.items():
-            if col in df.columns:
-                # Transform the column's values with prefix
-                train_transformed = df_train[col].apply(lambda x: [f"{prefix}_{item}" for item in x])
-                test_transformed = df_test[col].apply(lambda x: [f"{prefix}_{item}" for item in x])
-                
-                # Get MLB for this column
-                mlb = self.mlb_transformers[col]
-                
-                # Fit MLB on training data only
-                X_train_cat = mlb.fit_transform(train_transformed)
-                X_test_cat = mlb.transform(test_transformed)  # Use transform, not fit_transform
-                
-                # Add feature names
-                feature_names.extend([f"{prefix}_{item}" for item in mlb.classes_])
-                train_sparse_matrices.append(X_train_cat)
-                test_sparse_matrices.append(X_test_cat)
-        
-        # Combine all features
-        X_train = hstack(train_sparse_matrices).tocsr()
-        X_test = hstack(test_sparse_matrices).tocsr()
-        self.feature_names = feature_names
-        
-        logger.info(f"Split data into {len(self.train_indices)} training and {len(self.test_indices)} test samples")
-        logger.info(f"Total number of features: {len(feature_names)}")
-        logger.info(f"Training set shape: {X_train.shape}")
-        logger.info(f"Test set shape: {X_test.shape}")
-        
-        return X_train, X_test
-
-    def train(self, X: np.ndarray) -> None:
-        """
-        Train the KNN model.
-        
-        Args:
-            X: Training feature matrix
-        """
-        self.model = NearestNeighbors(
-            n_neighbors=self.n_neighbors,
-            metric='cosine',
-            algorithm='brute'
-        )
-        self.model.fit(X)
-
-    def predict_related_slots(self, 
-                            game_idx: int, 
-                            n_slots: Optional[int] = None,
-                            n_neighbors: Optional[int] = None) -> Tuple[List[int], List[float], Dict[int, int]]:
-        """
-        Predict related slots for a given game index.
-        
-        Args:
-            game_idx: Index of the game to predict for
-            n_slots: Number of slots to predict (default: same as actual related slots)
-            n_neighbors: Number of similar games to consider (default: self.n_neighbors)
-            
-        Returns:
-            Tuple containing:
-            - List of predicted slot IDs
-            - List of distances to similar games
-            - Dictionary of slot frequencies
-        """
-        if n_neighbors is None:
-            n_neighbors = self.n_neighbors
-            
-        # Get similar games
-        distances, indices = self.model.kneighbors(
-            X=self.model._fit_X[game_idx:game_idx+1],
-            n_neighbors=n_neighbors+1  # +1 because the first result is the game itself
-        )
-        
-        # Get related slots from similar games
-        similar_slots = []
-        for idx in indices[0][1:]:  # Skip the game itself
-            similar_slots.extend(self.all_related_slots[idx])
-        
-        # Count slot frequencies
-        slot_counts = Counter(similar_slots)
-        
-        # If n_slots not specified, use the same number as actual related slots
-        if n_slots is None:
-            n_slots = len(self.all_related_slots[game_idx])
-        
-        # Get the most common slots
-        predicted_slots = [slot for slot, _ in slot_counts.most_common(n_slots)]
-        
-        return predicted_slots, distances[0][1:], dict(slot_counts)  # Skip first distance (self)
-
-    def evaluate_model(self, X_train: np.ndarray, X_test: np.ndarray, n_slots: int = 8) -> Dict[str, float]:
-        """
-        Evaluate the model using various metrics.
-        
-        Args:
-            X_train: Training feature matrix
-            X_test: Test feature matrix
-            n_slots: Number of slots to predict
-            
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        if not hasattr(self, 'model') or self.model is None:
-            raise ValueError("Model must be trained before evaluation")
-            
-        # Evaluate on both train and test sets
-        train_metrics = self._evaluate_set(X_train, self.train_indices, "train", n_slots)
-        test_metrics = self._evaluate_set(X_test, self.test_indices, "test", n_slots)
-        
-        return {
-            'train': train_metrics,
-            'test': test_metrics
-        }
+def predict_for_samples(model: NearestNeighbors, X: np.ndarray, sample_indices: np.ndarray, train_indices: np.ndarray, 
+                       related_slots: np.ndarray, is_train: bool = True, n_slots: int = 8) -> List[Tuple[int, List[int], float]]:
+    """
+    Make predictions for a set of samples.
     
-    def _evaluate_set(self, X: np.ndarray, indices: np.ndarray, set_name: str, n_slots: int) -> Dict[str, float]:
-        """Helper method to evaluate a specific set."""
-        # Calculate metrics
-        precision_scores = []
-        recall_scores = []
-        f1_scores = []
+    Args:
+        model: Trained KNN model
+        X: Feature matrix
+        sample_indices: Indices of samples to predict for
+        train_indices: Boolean array indicating training samples
+        related_slots: Array of related slots
+        is_train: Whether predicting for training samples
+        n_slots: Number of slots to predict
         
-        for i, idx in enumerate(indices):
-            # Get actual related slots
-            actual = set(self.all_related_slots[idx])
-            if not actual:  # Skip if no related slots
-                continue
-                
-            # Get predicted related slots
-            predicted, _, _ = self.predict_related_slots(i, n_slots=n_slots)
-            predicted = set(predicted)
-            
-            # Calculate metrics
-            true_positives = len(actual.intersection(predicted))
-            precision = true_positives / len(predicted) if predicted else 0
-            recall = true_positives / len(actual) if actual else 0
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-            
-            precision_scores.append(precision)
-            recall_scores.append(recall)
-            f1_scores.append(f1)
-        
-        # Calculate average metrics
-        avg_precision = np.mean(precision_scores)
-        avg_recall = np.mean(recall_scores)
-        avg_f1 = np.mean(f1_scores)
-        
-        # Log results
-        logger.info(f"\n{set_name.capitalize()} Set Evaluation Results:")
-        logger.info(f"Average Precision: {avg_precision:.4f}")
-        logger.info(f"Average Recall: {avg_recall:.4f}")
-        logger.info(f"Average F1 Score: {avg_f1:.4f}")
-        
-        return {
-            'precision': avg_precision,
-            'recall': avg_recall,
-            'f1': avg_f1
-        }
+    Returns:
+        List of tuples containing (game_idx, predicted_slots, avg_distance)
+    """
+    # Get predictions for the specified samples only
+    distances, indices = model.kneighbors(X[sample_indices])
+    
+    # Create a DataFrame for the samples with correct size
+    df_subset = pd.DataFrame(index=range(np.sum(sample_indices)))
+    
+    # Get predictions using get_top_related_slots
+    predictions = get_top_related_slots(
+        df_subset,
+        indices,
+        distances,
+        train_indices,
+        related_slots,
+        is_train=is_train,
+        n_slots=n_slots
+    )
+    
+    return predictions
 
 def main():
-    # Initialize model
-    model = CategoricalGameSimilarityModel(n_neighbors=3, random_state=42)
+    # Set random seed for reproducibility
+    np.random.seed(42)
     
     try:
         # Load data
         data_path = 'parsed_data/slot_data.csv'
-        df = model.load_data(data_path)
+        df = load_data(data_path)
         
-        # Prepare features and split data
-        X_train, X_test = model.prepare_features(df)
+        # Split data into train and test sets
+        n_samples = len(df)
+        indices = np.random.permutation(n_samples)
+        train_size = int(0.8 * n_samples)
+        train_indices = np.zeros(n_samples, dtype=bool)
+        train_indices[indices[:train_size]] = True
         
-        # Train model
-        model.train(X_train)
+        logger.info(f"\nData split:")
+        logger.info(f"Training set size: {train_size}")
+        logger.info(f"Test set size: {n_samples - train_size}")
         
-        # Test if a game appears as its own nearest neighbor
-        test_idx = 0
-        distances, indices = model.model.kneighbors(
-            X=model.model._fit_X[test_idx:test_idx+1],
-            n_neighbors=model.n_neighbors+1
-        )
+        # Prepare features
+        X = prepare_features(df, train_indices)
         
-        # Check if the game itself is the first neighbor
-        threshold = 1e-10
-        if indices[0][0] == test_idx and distances[0][0] < threshold:
-            logger.info("✓ Confirmed: The game appears as its own nearest neighbor with distance ~0")
-        else:
-            logger.info("✗ Warning: The game does not appear as its own nearest neighbor")
+        # Train KNN model with k=3
+        logger.info("\nTraining KNN model...")
+        model = NearestNeighbors(n_neighbors=3, metric='cosine', algorithm='brute')
+        model.fit(X[train_indices])  # Fit only on training data
         
-        # Evaluate model on both train and test sets
-        metrics = model.evaluate_model(X_train, X_test, n_slots=8)
+        # Save model and necessary data
+        model_path = 'api_service/model.pkl'  # Updated path to match Dockerfile
+        save_model(model_path, model, X, train_indices, df)
         
-        # Show example predictions
-        n_samples = X_train.shape[0] if hasattr(X_train, 'shape') else len(X_train)
-        for idx in range(min(3, n_samples)):
-            predicted_slots, distances, slot_frequencies = model.predict_related_slots(idx)
-            actual_slots = model.all_related_slots[idx]
+        # Test specific slot IDs
+        test_slot_ids = [143, 160, 138]  # The three slot IDs we want to test
+        logger.info(f"\nTesting specific slot IDs: {test_slot_ids}")
+        
+        # Create a DataFrame with just these slots
+        test_df = df[df['slot_id'].isin(test_slot_ids)].copy()
+        
+        # Get indices for these slots in the feature matrix
+        test_indices = np.array([df[df['slot_id'] == slot_id].index[0] for slot_id in test_slot_ids])
+        
+        # Get predictions for these specific slots
+        distances, indices = model.kneighbors(X[test_indices])
+        
+        # Log predictions for each slot
+        logger.info("\nPredictions for specific slots:")
+        for i, slot_id in enumerate(test_slot_ids):
+            predicted_slots = get_top_related_slots(
+                test_df.iloc[i:i+1],
+                indices[i:i+1],
+                distances[i:i+1],
+                train_indices,
+                df['related_slot_ids'].values,
+                is_train=False,
+                n_slots=8
+            )[0][1]  # Get the predicted slots from the first (and only) result
             
-            logger.info(f"\nGame {idx}:")
-            logger.info(f"Actual: {actual_slots}")
-            logger.info(f"Predicted: {predicted_slots}")
-            logger.info("Top 5 slot frequencies:")
-            for slot, freq in sorted(slot_frequencies.items(), key=lambda x: x[1], reverse=True)[:5]:
-                logger.info(f"  Slot {slot}: {freq} times")
-        
-        # Save the trained model
-        model.save('api_service/categorical_model.pkl')
+            actual_slots = set(test_df['related_slot_ids'].iloc[i])
+            predicted_slots = set(predicted_slots)
+            overlap = len(actual_slots.intersection(predicted_slots))
+            total_unique = len(actual_slots.union(predicted_slots))
+            overlap_ratio = overlap / total_unique if total_unique > 0 else 0
+            
+            logger.info(f"\nGame {slot_id}:")
+            logger.info(f"Actual slots: {actual_slots}")
+            logger.info(f"Predicted slots: {predicted_slots}")
+            logger.info(f"Overlap: {overlap} slots")
+            logger.info(f"Overlap ratio: {overlap_ratio:.2f}")
+            logger.info(f"Average distance to neighbors: {np.mean(distances[i]):.6f}")
             
     except Exception as e:
         logger.error(f"Error in main execution: {str(e)}")

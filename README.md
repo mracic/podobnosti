@@ -4,16 +4,44 @@ This repository explores and recommends the most similar games based on the prov
 
 To run the code one must first create an environment such as "conda create --name ds python=3.12 numpy pandas matplotlib seaborn scikit-learn scipy jupyterlab". Running the scripts requires folder "raw_game_data" with ".slot" files to be contained in the working directory. Running "python parse_slot_data.py" will parse the raw data and construct two csv files.
 
+## Data Overview
+
+The `01_data_values_overview.ipynb` notebook provides an exploratory data analysis of the slot game dataset:
+- Visualizes distributions of numeric features (RTP, volatility, etc.)
+- Shows frequency distributions of categorical features (FEATURES, THEME, GENRE, etc.)
+- Analyzes relationships between related slots
+- Identifies potential data quality issues and missing values
+- Helps understand the structure and characteristics of the dataset before modeling
+
 ## Data Preprocessing and Modeling
 
 The "numeric_similarity_model.py" uses only numeric values:
 - Removes text-based features (name, url, provider, provider_url, review_text, dates...) and categorical features
 - Predicts most similar slots for each slot
 
-To run the similarity model:
+To run the numerical similarity model:
 1. Ensure you have the processed data from parse_slot_data.py
 2. Run "python numeric_similarity_model.py" to train and evaluate the model
 3. The model will output evaluation metrics and save the trained model for future use
+
+
+The "categorical_similarity_model.py" uses both numeric and categorical values:
+- Uses numeric features (RTP, volatility, etc.)
+- Uses categorical features (FEATURES, THEME, GENRE, OTHER_TAGS, TECHNOLOGY, OBJECTS, TYPE)
+
+Training Set Results:
+Total games: 21547
+Correct predictions (50%+ overlap): 19178
+Accuracy: 0.8901
+Precision: 0.8901
+Recall: 0.8901
+
+Test Set Results:
+Total games: 5387
+Correct predictions (50%+ overlap): 250
+Accuracy: 0.0464
+Precision: 0.0464
+Recall: 0.0464
 
 ## API Service
 
@@ -50,19 +78,12 @@ Parameters:
 
 Example:
 ```bash
-curl "http://localhost:8000/predlagaj/123?predlogi=5"
+curl "http://localhost:8000/predlagaj/143?predlogi=5"
 ```
 
 Response:
 ```json
-{
-    "game_id": 123,
-    "similar_games": [
-        {"slot_id": 456, "distance": 0.123},
-        {"slot_id": 789, "distance": 0.234},
-        ...
-    ]
-}
+{"slot_id":143,"related_slots":[245,246,247,248,249]}
 ```
 
 ## Ideas for future work
